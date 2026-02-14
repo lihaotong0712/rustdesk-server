@@ -1,0 +1,38 @@
+# Rust
+/target/
+/.cargo
+**/*.rs.bk
+
+# Claude AI
+/.claude
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker volumes and data
+/data/
+
+# Logs
+*.log
+
+# Environment variables
+.env
+.env.local
+
+# Generated certificates (except original template)
+*.crt
+*.key
+*.pem
+id_ed25519*
+!original_ed25519.pub
+
+# Build artifacts
+*.deb
+*.rpm

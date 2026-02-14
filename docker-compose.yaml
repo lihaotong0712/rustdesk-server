@@ -1,0 +1,64 @@
+services:
+  hbbs:
+    container_name: rustdesk-hbbs
+    image: ghcr.io/lihaotong0712/rustdesk-server:latest
+    # image: docker.io/rustdesk/rustdesk-server-pro:latest
+    # build:
+    # context: .
+    # dockerfile: Dockerfile
+    command: hbbs
+    volumes:
+      - ./data:/root
+    networks:
+      - rustdesk-net
+    ports:
+      - 21114:21114
+      - 21115:21115
+      - 21116:21116
+      - 21116:21116/udp
+      - 21118:21118
+    depends_on:
+      - hbbr
+      - license-server
+    restart: unless-stopped
+
+  hbbr:
+    container_name: rustdesk-hbbr
+    image: ghcr.io/lihaotong0712/rustdesk-server:latest
+    # image: docker.io/rustdesk/rustdesk-server-pro:latest
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+    command: hbbr
+    volumes:
+      - ./data:/root
+    networks:
+      - rustdesk-net
+    ports:
+      - 21117:21117 # 自定义 hbbr 映射端口
+      - 21119:21119 # web client
+    restart: unless-stopped
+
+  license-server:
+    container_name: rustdesk-license-server
+    image: ghcr.io/lihaotong0712/rustdesk-server:latest
+    # image: docker.io/rustdesk/rustdesk-server-pro:latest
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+    command: license-server
+    networks:
+      rustdesk-net:
+        aliases:
+          - rustdesk.com
+    environment:
+      - LICENSE_TYPE=2 # 1: basic 2: advanced 3: custom
+      - LICENSE_MAX_PEERS=999999999
+      - LICENSE_MAX_USERS=999999999
+      - LICENSE_MAX_CONNS=999999999
+      - LICENSE_EXPIRY_SECS=315360000 # 10 years
+    restart: unless-stopped
+
+networks:
+  rustdesk-net:
+    driver: bridge
