@@ -2,8 +2,8 @@ name: Sync Upstream and Build Docker Image
 
 on:
   schedule:
-    # 每月1号 UTC 02:00 执行 (即北京时间10:00)
-    - cron: "0 2 1 * *"
+    # 每周一 UTC 02:00 执行 (即北京时间10:00)
+    - cron: "0 2 * * 1"
   workflow_dispatch:
     inputs:
       force_build:
@@ -16,6 +16,8 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   UPSTREAM_IMAGE: rustdesk/rustdesk-server-pro:latest
+  RUST_TOOLCHAIN: 1.93.0
+  CROSS_VERSION: 0.2.5
 
 jobs:
   check-upstream:
@@ -28,6 +30,9 @@ jobs:
       current_digest: ${{ steps.current.outputs.digest }}
 
     steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -38,10 +43,11 @@ jobs:
       - name: Get upstream image digest
         id: upstream
         run: |
-          DIGEST=$(docker manifest inspect ${{ env.UPSTREAM_IMAGE }} | jq -r '.manifests[0].digest // .Descriptor.digest // empty')
-          if [[ -z "$DIGEST" ]]; then
-            echo "Failed to get upstream digest, using timestamp as fallback"
-            DIGEST="sha256:$(date +%s | sha256sum | cut -d' ' -f1)"
+          set -euo pipefail
+          DIGEST=$(docker buildx imagetools inspect "${{ env.UPSTREAM_IMAGE }}" --format '{{json .Manifest}}' | jq -r '.digest // empty')
+          if [[ -z "$DIGEST" || "$DIGEST" == "null" ]]; then
+            echo "::error::Failed to get manifest-list digest for ${{ env.UPSTREAM_IMAGE }}"
+            exit 1
           fi
           echo "digest=$DIGEST" >> $GITHUB_OUTPUT
           echo "Upstream digest: $DIGEST"
@@ -49,10 +55,11 @@ jobs:
       - name: Get current base image digest
         id: current
         run: |
+          set -euo pipefail
           # 尝试获取当前镜像的 label 中记录的上游 digest
           CURRENT_DIGEST=""
           if docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest 2>/dev/null; then
-            CURRENT_DIGEST=$(docker inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest 2>/dev/null | jq -r '.[0].Config.Labels["upstream.digest"] // empty' || echo "")
+            CURRENT_DIGEST=$(docker inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest 2>/dev/null | jq -r '.[0].Config.Labels["upstream.digest"] // empty') || CURRENT_DIGEST=""
           fi
           echo "digest=$CURRENT_DIGEST" >> $GITHUB_OUTPUT
           if [[ -z "$CURRENT_DIGEST" ]]; then
@@ -64,6 +71,7 @@ jobs:
       - name: Compare digests
         id: compare
         run: |
+          set -euo pipefail
           UPSTREAM="${{ steps.upstream.outputs.digest }}"
           CURRENT="${{ steps.current.outputs.digest }}"
           FORCE="${{ github.event.inputs.force_build }}"
@@ -100,8 +108,77 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+
+      - name: Restore Rust build cache and binaries
+        id: rust-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cross
+            target
+            dist
+          key: rust-cross-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ env.CROSS_VERSION }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'src/**') }}
+          restore-keys: |
+            rust-cross-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ env.CROSS_VERSION }}-
+
+      - name: Check restored license-server binaries
+        id: cached-binaries
+        run: |
+          set -euo pipefail
+          if [[ "${{ steps.rust-cache.outputs.cache-hit }}" == "true" && -x dist/license-server-amd64 && -x dist/license-server-arm64 ]]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            echo "Using cached license-server binaries"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "Cached binaries are missing or not an exact cache hit; rebuilding"
+          fi
+
+      - name: Install Rust toolchain
+        if: steps.cached-binaries.outputs.ready != 'true'
+        run: |
+          set -euo pipefail
+          rustup toolchain install "${RUST_TOOLCHAIN}" --profile minimal
+          rustup default "${RUST_TOOLCHAIN}"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install cross
+        if: steps.cached-binaries.outputs.ready != 'true'
+        run: |
+          set -euo pipefail
+          if [[ ! -x "$HOME/.cargo/bin/cross" ]]; then
+            cargo install cross --version "${CROSS_VERSION}" --locked
+          fi
+          cross --version
+
+      - name: Build license-server binaries with cross
+        if: steps.cached-binaries.outputs.ready != 'true'
+        run: |
+          set -euo pipefail
+          cross build --release --target x86_64-unknown-linux-gnu
+          cross build --release --target aarch64-unknown-linux-gnu
+          mkdir -p dist
+          install -m 0755 target/x86_64-unknown-linux-gnu/release/license-server dist/license-server-amd64
+          install -m 0755 target/aarch64-unknown-linux-gnu/release/license-server dist/license-server-arm64
+          ls -lh dist/
+
+      - name: Save Rust build cache and binaries
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cross
+            target
+            dist
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
 
       - name: Log in to Container Registry
         uses: docker/login-action@v3
@@ -132,14 +209,16 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./Dockerfile
+          file: ./Dockerfile.ci
           platforms: linux/amd64,linux/arm64
           push: true
+          pull: true
+          no-cache: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
           build-args: |
+            UPSTREAM_REF=${{ env.UPSTREAM_IMAGE }}@${{ needs.check-upstream.outputs.upstream_digest }}
+            UPSTREAM_IMAGE=${{ env.UPSTREAM_IMAGE }}
             UPSTREAM_DIGEST=${{ needs.check-upstream.outputs.upstream_digest }}
 
       - name: Generate artifact attestation
